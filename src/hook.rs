@@ -59,6 +59,8 @@ pub enum Event {
     /// deadline passes, the binding closes, or a newer watcher of the same
     /// window replaces this one.
     Watch,
+    /// Deliver counts-only notices through a native Codex daemon.
+    CodexWatch,
 }
 
 /// The tools `--event call` serves: exactly what the hook scripts call
@@ -78,9 +80,10 @@ impl std::str::FromStr for Event {
             "status" => Ok(Self::Status),
             "call" => Ok(Self::Call),
             "watch" => Ok(Self::Watch),
+            "codex_watch" => Ok(Self::CodexWatch),
             other => bail!(
                 "unknown hook event '{other}'; use session_start, heartbeat, stop, \
-                 session_end, status, call or watch"
+                 session_end, status, call, watch or codex-watch"
             ),
         }
     }
@@ -139,7 +142,11 @@ fn git_place(dir: &Path) -> (Option<String>, Option<String>) {
 }
 
 /// One tool call as the bound window, with its credential and epoch.
-async fn call_as_window(binding: &Binding, tool: &str, args: Value) -> anyhow::Result<Value> {
+pub(crate) async fn call_as_window(
+    binding: &Binding,
+    tool: &str,
+    args: Value,
+) -> anyhow::Result<Value> {
     let url = binding
         .mcp_url
         .as_deref()
@@ -340,12 +347,12 @@ struct WatchState {
 
 /// One reading of what is waiting for the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Reading {
-    direct: i64,
-    newest_direct: i64,
+pub(crate) struct Reading {
+    pub(crate) direct: i64,
+    pub(crate) newest_direct: i64,
     /// `None` when the inbox could not be read this time; the last known
     /// figure stands rather than a zero nobody observed.
-    inbox: Option<i64>,
+    pub(crate) inbox: Option<i64>,
 }
 
 fn watch_path(config_dir: &Path, binding_id: &str) -> std::path::PathBuf {
@@ -364,7 +371,7 @@ fn write_watch_state(path: &Path, state: &WatchState) -> anyhow::Result<()> {
 /// one addressed to it, and undelivered conversation messages when the team
 /// has conversations at all. A history read (`only_new: false`) never moves
 /// the window's read cursor.
-async fn pending_for_window(binding: &Binding) -> anyhow::Result<Reading> {
+pub(crate) async fn pending_for_window(binding: &Binding) -> anyhow::Result<Reading> {
     let who = call_as_window(binding, "whoami", json!({})).await?;
     let direct = who["unread_direct_messages"].as_i64().unwrap_or(0);
     let newest = call_as_window(
@@ -393,7 +400,7 @@ async fn pending_for_window(binding: &Binding) -> anyhow::Result<Reading> {
 
 /// The text the host shows the woken model. Counts only: bodies are
 /// teammates' words, and the model reads them through the usual tools.
-fn wake_text(direct: i64, inbox: i64) -> String {
+pub(crate) fn wake_text(direct: i64, inbox: i64) -> String {
     let mut waiting = Vec::new();
     if direct > 0 {
         waiting.push(format!("{direct} unread direct message(s) (read_messages)"));
@@ -637,7 +644,7 @@ pub async fn run(
             publish_presence(&binding, cwd, "idle", false, 120).await?;
             Ok(None)
         }
-        Event::Watch => bail!("--event watch runs through hook::watch"),
+        Event::Watch | Event::CodexWatch => bail!("watch events run through their native adapter"),
         Event::Call => {
             let Some((tool, args)) = call else {
                 bail!("--event call needs --tool <name> and, optionally, --args <json object>");

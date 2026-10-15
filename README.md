@@ -431,8 +431,8 @@ The plugin comes fully preconfigured:
   unread messages never wake a window twice, a newer watcher replaces the
   older one, and it gives up quietly after `BUS_WATCH_SECS` (default 14000 s,
   under the hook's 4 h timeout). Authenticated mode only (it needs the binary
-  and the window's own credential); other hosts have no equivalent, so Codex
-  still sees news at the end of a turn.
+  and the window's own credential). Codex can opt into the daemon adapter
+  described below; other hosts see news at the end of a turn.
 
 You no longer set `BUS_SESSION` for this: the proxy derives the session from
 the conversation id Claude Code gives it, so a window keeps its identity across
@@ -753,6 +753,32 @@ as usual, plus two that never reach the bus:
   still holds (claims, locks) is reported, never transferred. A different
   team needs a new conversation, because switching credentials cannot erase
   what this conversation has already seen.
+
+Native Codex on Linux can opt into idle wake with
+`ai-crew-sync mcp proxy --codex-wake` (off by default). The adapter starts only
+after Codex supplies its exact `_meta.threadId` and the bus authenticates that
+window. It waits without model turns, reads pending counts without advancing
+read cursors or acknowledging messages, and sends a counts-only tool output
+through the local experimental Codex app-server daemon. The notice identifies
+agent correspondence; it grants no human authorization. Claude hooks are unchanged.
+
+For an already-open window whose proxy wrote an authenticated request-meta
+binding, run a bounded watcher without restarting the window:
+
+```bash
+ai-crew-sync context hook --binding <exact-native-thread-id> --event codex-watch --cwd /path/to/repository --watch-secs 14000
+```
+
+The watcher verifies the original live proxy, native thread and repository cwd.
+Only one watcher holds each window's lock. Closed or replaced bindings stop it;
+busy, unloaded, child and approval-waiting threads defer delivery. It never
+interrupts or steers a turn, changes model/permission settings, or starts a new
+conversation. If a regular turn starts between the idle check and delivery,
+Codex queues the standalone tool output for that turn. This requires a daemon
+supporting `turn/start.toolOutput` (verified with Codex 0.162.1); unsupported RPCs
+stay pending. A crash after RPC acceptance but before checkpointing can repeat a
+notice. Direct messages use arrival IDs; optional conversation notifications use
+counts and can miss a replacement arrival when the count stays unchanged.
 
 Long waits are one call. The bus answers a `wait_for_updates` within 55 s
 (HTTP intermediaries cut longer requests), and a host that simply asks again

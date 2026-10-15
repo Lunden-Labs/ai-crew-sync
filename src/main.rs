@@ -403,6 +403,9 @@ enum McpCmd {
     /// config (command: ai-crew-sync, args: [mcp, proxy]); credentials come
     /// from local profiles, never from the client config.
     Proxy {
+        /// Wake an idle native Codex window when direct correspondence arrives.
+        #[arg(long)]
+        codex_wake: bool,
         #[command(flatten)]
         select: ContextSelect,
         /// Initial project label (defaults to the project's .acs.toml).
@@ -527,7 +530,7 @@ enum ContextCmd {
         /// Id of the host conversation, from the hook payload's session_id.
         #[arg(long)]
         binding: String,
-        /// session_start | heartbeat | stop | session_end | status | call | watch
+        /// session_start | heartbeat | stop | session_end | status | call | watch | codex-watch
         #[arg(long)]
         event: String,
         /// Working directory the presence line describes; the current
@@ -749,6 +752,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Admin(cmd) if !admin_needs_database(&cmd) => return run_admin_remote(cmd).await,
         Command::Context(cmd) => return run_context(cmd).await,
         Command::Mcp(McpCmd::Proxy {
+            codex_wake,
             select,
             project,
             role,
@@ -761,6 +765,7 @@ async fn main() -> anyhow::Result<()> {
             inputs.host_session = None;
             let state_dir = inputs.config_dir.clone();
             return proxy::run(proxy::ProxyOptions {
+                codex_wake,
                 inputs,
                 project,
                 role,
@@ -1407,6 +1412,19 @@ async fn run_context(cmd: ContextCmd) -> anyhow::Result<()> {
                 Some(d) => d,
                 None => std::env::current_dir()?,
             };
+            if event == hook::Event::CodexWatch {
+                #[cfg(unix)]
+                return ai_crew_sync::codex_bridge::run(
+                    &context::config_dir()?,
+                    &binding,
+                    watch_secs.clamp(60, 86_400),
+                    Some(&cwd),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+                #[cfg(not(unix))]
+                anyhow::bail!("Codex wake requires a Unix daemon socket");
+            }
             let hours = digest_hours.clamp(1, 336);
             let call = match event {
                 hook::Event::Call => {

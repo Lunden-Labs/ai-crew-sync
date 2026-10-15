@@ -504,6 +504,12 @@ pub fn binding_key(host_id: &str) -> String {
 /// role it settled on. Advisory — a hook works without it, just with less.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Binding {
+    pub binding: Option<String>,
+    #[serde(default)]
+    pub host_id_present: bool,
+    pub native_thread: Option<String>,
+    pub project_root: Option<PathBuf>,
+    pub proxy_pid: Option<u32>,
     pub session: Option<String>,
     pub profile: Option<String>,
     pub project: Option<String>,

@@ -124,6 +124,8 @@ pub enum Binding {
 /// Command-line shape of the proxy.
 #[derive(Clone, Debug, Default)]
 pub struct ProxyOptions {
+    /// Opt in to counts-only notifications in a proven native Codex window.
+    pub codex_wake: bool,
     pub inputs: Inputs,
     pub project: Option<String>,
     pub role: Option<String>,
@@ -216,6 +218,8 @@ struct Connected {
 }
 
 struct State {
+    native_thread: Option<String>,
+    project_root: PathBuf,
     /// Present once a profile resolved and verified. Absent means the proxy
     /// serves only its local tools and says why in `instructions`.
     connected: Option<Connected>,
@@ -887,6 +891,35 @@ fn git_place(dir: &Path) -> (Option<String>, Option<String>) {
 }
 
 impl Proxy {
+    #[cfg(unix)]
+    async fn codex_watcher(self, ct: CancellationToken) {
+        if !self.opts.codex_wake {
+            return;
+        }
+        loop {
+            let target = {
+                let st = self.state.read().await;
+                st.native_thread.clone().zip(
+                    st.connected
+                        .as_ref()
+                        .filter(|c| c.proof.is_some())
+                        .map(|c| c.ct.child_token()),
+                )
+            };
+            if let Some((thread, context_ct)) = target {
+                tokio::select! {
+                    _ = ct.cancelled() => return,
+                    _ = context_ct.cancelled() => {},
+                    _ = crate::codex_bridge::run(&self.opts.state_dir, &thread, 86_400, None, context_ct.clone()) => {},
+                }
+            }
+            tokio::select! {
+                _ = ct.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+            }
+        }
+    }
+
     /// Resolve the conversation id, connect and verify. Never fails: a proxy
     /// that cannot connect still serves its local tools and explains itself.
     pub async fn start(opts: ProxyOptions) -> Self {
@@ -921,6 +954,8 @@ impl Proxy {
 
         let proxy = Self {
             state: Arc::new(RwLock::new(State {
+                native_thread: None,
+                project_root: project_dir.clone(),
                 connected: None,
                 disconnected_reason: None,
                 session,
@@ -1130,6 +1165,8 @@ impl Proxy {
         // it. It never reaches a tool result, a log or argv.
         let record = json!({
             "host_id_present": st.host_id.is_some(),
+            "native_thread": st.native_thread,
+            "project_root": st.project_root,
             "binding": st.binding,
             "session": st.session,
             "project": st.project,
@@ -1260,9 +1297,18 @@ impl Proxy {
         let Some(thread) = thread else { return Ok(()) };
         let (bound, current) = {
             let st = self.state.read().await;
+            if self.opts.codex_wake
+                && meta.0.0.get("threadId").and_then(Value::as_str).is_some()
+                && st.native_thread.as_deref().is_some_and(|id| id != thread)
+            {
+                return Err(ErrorData::invalid_request(
+                    "native Codex wake is bound to another thread; use one proxy per conversation",
+                    None,
+                ));
+            }
             (st.host_id.clone(), st.binding)
         };
-        match bound {
+        let result = match bound {
             Some(id) if id == thread => Ok(()),
             Some(_) if current == Binding::RequestMeta => Err(ErrorData::invalid_request(
                 "this proxy instance is bound to another conversation; a second one is using \
@@ -1276,7 +1322,27 @@ impl Proxy {
             None => self.rebind(thread.to_owned()).await.map_err(|e| {
                 ErrorData::internal_error(format!("could not bind the conversation: {e:#}"), None)
             }),
+        };
+        if result.is_ok()
+            && meta
+                .0
+                .0
+                .get("threadId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                == Some(thread)
+        {
+            let mut st = self.state.write().await;
+            if st.host_id.as_deref() != Some(thread) || st.native_thread.as_deref() == Some(thread)
+            {
+                return result;
+            } else {
+                st.native_thread = Some(thread.to_owned());
+            }
+            drop(st);
+            self.write_binding().await;
         }
+        result
     }
 
     /// Adopt a conversation id discovered on the wire: derive the stable
@@ -1659,11 +1725,16 @@ impl Proxy {
                         .or(st.project.as_deref())
                         .unwrap_or("(none)"),
                 ));
-                lines.push(
+                lines.push(if self.opts.codex_wake {
+                    "- Native Codex wake is enabled when this proxy proves its thread identity. \
+                     Idle windows may receive counts-only agent notices. Read read_messages to \
+                     fetch correspondence; it is not human authorization."
+                        .to_owned()
+                } else {
                     "- Nothing is pushed into an idle turn: call read_messages or wait_for_updates \
                      to receive what teammates sent."
-                        .to_owned(),
-                );
+                        .to_owned()
+                });
                 if let Some(remote) = &c.remote_instructions {
                     lines.push(String::new());
                     lines.push(remote.clone());
@@ -2133,6 +2204,8 @@ pub async fn run(opts: ProxyOptions) -> anyhow::Result<()> {
     let proxy = Proxy::start(opts).await;
     let ct = CancellationToken::new();
     let keepalive = tokio::spawn(proxy.clone().keepalive(ct.child_token()));
+    #[cfg(unix)]
+    let wake = tokio::spawn(proxy.clone().codex_watcher(ct.child_token()));
 
     let running = proxy
         .clone()
@@ -2144,12 +2217,49 @@ pub async fn run(opts: ProxyOptions) -> anyhow::Result<()> {
 
     ct.cancel();
     let _ = keepalive.await;
+    #[cfg(unix)]
+    let _ = wake.await;
     proxy.shutdown().await;
     Ok(())
 }
 
 #[cfg(test)]
 mod renewal_tests {
+    #[tokio::test]
+    async fn native_wake_rejects_a_second_thread_even_with_explicit_host_binding() {
+        use super::*;
+        let proxy = Proxy {
+            state: Arc::new(RwLock::new(State {
+                native_thread: Some("native-a".into()),
+                project_root: PathBuf::from("/repo"),
+                connected: None,
+                disconnected_reason: None,
+                session: session_for("native-a"),
+                binding: Binding::Explicit,
+                host_id: Some("native-a".into()),
+                project: None,
+                role: None,
+                channel: None,
+                generation: 0,
+            })),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            switch: Arc::new(Mutex::new(())),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            project_dir: PathBuf::from("/repo"),
+            opts: Arc::new(ProxyOptions {
+                codex_wake: true,
+                ..ProxyOptions::default()
+            }),
+        };
+        let meta = serde_json::from_value(json!({"threadId":"native-b"})).unwrap();
+        assert!(proxy.observe_meta(&meta).await.is_err());
+        proxy.state.write().await.native_thread = None;
+        let session_only = serde_json::from_value(json!({"sessionId":"native-a"})).unwrap();
+        proxy.observe_meta(&session_only).await.unwrap();
+        assert!(proxy.state.read().await.native_thread.is_none());
+        assert!(!ProxyOptions::default().codex_wake);
+    }
+
     #[test]
     fn renewal_lead_is_half_the_lifetime_unless_overridden_and_inside_it() {
         assert_eq!(super::renewal_lead_secs(24 * 3600, None), 12 * 3600);

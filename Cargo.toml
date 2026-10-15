@@ -86,12 +86,14 @@ async-nats = "0.50"
 # fetched batch arrives as a Stream.
 bytes = "1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
+tokio-websockets = { version = "=0.10.1", features = ["client", "ring", "rand"] }
 
 # Outgoing webhooks. Kept on the same major as the reqwest rmcp resolves,
 # so the binary carries one HTTP client and one TLS stack, not two.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]
+tokio-websockets = { version = "=0.10.1", features = ["server"] }
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 base64 = "0.23"
 
