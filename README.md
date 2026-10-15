@@ -815,10 +815,13 @@ process is refused rather than mixed in. When it was fixed by
 binding wins and ids on the wire are ignored — so configure the host to start
 one proxy per conversation.
 
-The `initialize` result's `instructions` tell the model who and where this
-window is (agent, team, session address, project, role, channel) plus the
-bus's own conventions — every MCP client passes those on, so this needs no
-hooks. The unread direct messages, open claims and team digest are added by a
+The `initialize` result's `instructions` provide connection context and the
+bus's conventions. Cached instructions are not a reply address: call
+`session_status` and `whoami` in the current conversation and use their returned
+identity. With `--codex-wake`, a bootstrap session advertises neither presence
+nor a reply address; remote tool calls require `_meta.threadId` proof.
+`sessionId` alone does not prove a native Codex window. The unread direct
+messages, open claims and team digest are added by a
 session-start hook where the host has one; elsewhere the model calls `whoami`
 and `team_digest` itself. Where a host *does* have lifecycle hooks, they run
 `ai-crew-sync context hook --binding <conversation id> --event <event>`: the

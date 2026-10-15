@@ -256,6 +256,8 @@ impl Drop for InFlight {
 pub struct Proxy {
     state: Arc<RwLock<State>>,
     in_flight: Arc<AtomicUsize>,
+    /// Keeps metadata binding and native proof private until connection commit.
+    binding_gate: Arc<Mutex<()>>,
     /// Serialises context switches.
     switch: Arc<Mutex<()>>,
     /// Pinged whenever the connected context changes, so the keepalive
@@ -357,8 +359,8 @@ fn local_tools() -> Vec<Tool> {
         .with_output_schema::<ConfigureResult>(),
         Tool::new(
             STATUS_TOOL,
-            "Who this window is on the bus (verified agent and team), its session id and \
-             address (`agent/session`, what teammates use to reach exactly this window), \
+            "Read the current bus identity (verified agent and team), session id and \
+             reply address (`agent/session`; Codex wake requires proven native thread identity), \
              project, role, default channel, and where its credential came from \
              (`credential_from`). Never returns credentials.",
             schema_of::<EmptyArgs>(),
@@ -967,6 +969,7 @@ impl Proxy {
                 generation: 0,
             })),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            binding_gate: Arc::new(Mutex::new(())),
             switch: Arc::new(Mutex::new(())),
             wake: Arc::new(tokio::sync::Notify::new()),
             opts: Arc::new(opts),
@@ -1069,14 +1072,34 @@ impl Proxy {
                     {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
-                    let held = report_holdings(&old.remote, &old.agent, &old.team, &session).await;
-                    // This window is no longer that identity, so its session
-                    // is closed rather than left live for nobody: a session
-                    // with no process behind it blocks its own label and
-                    // keeps a credential valid for a day. Claims and locks
-                    // are NOT transferred — they stay with the old identity
-                    // and expire on their leases, which is what `held`
-                    // reports back to the caller.
+                    let published = !self.awaiting_native(&*self.state.read().await);
+                    let held = if published {
+                        report_holdings(&old.remote, &old.agent, &old.team, &session).await
+                    } else {
+                        PreviousIdentity {
+                            agent: old.agent.clone(),
+                            team: old.team.clone(),
+                            session: session.clone(),
+                            open_claims: vec![],
+                            held_locks: vec![],
+                        }
+                    };
+                    // Retire presence while its credential still authenticates. A never-native
+                    // bootstrap must not create a presence row even on replacement.
+                    if published {
+                        let _ = tokio::time::timeout(
+                            EXIT_TIMEOUT,
+                            call_remote(
+                                &old.remote,
+                                "heartbeat",
+                                json!({
+                                    "status":"idle", "ttl_seconds":30, "project":"", "role":""
+                                }),
+                            ),
+                        )
+                        .await;
+                    }
+                    // Messages and holdings stay under the old session; no inbox is read or moved.
                     if old.proof.is_some() {
                         let _ = tokio::time::timeout(
                             EXIT_TIMEOUT,
@@ -1084,16 +1107,6 @@ impl Proxy {
                         )
                         .await;
                     }
-                    // The old identity goes quiet in its own name.
-                    let _ = tokio::time::timeout(
-                        EXIT_TIMEOUT,
-                        call_remote(
-                            &old.remote,
-                            "heartbeat",
-                            json!({"status": "idle", "ttl_seconds": 30}),
-                        ),
-                    )
-                    .await;
                     close_remote(old.remote).await;
                     Some(held)
                 }
@@ -1125,11 +1138,18 @@ impl Proxy {
         Ok(previous)
     }
 
+    fn awaiting_native(&self, st: &State) -> bool {
+        self.opts.codex_wake && st.native_thread.is_none()
+    }
+
     /// Presence for this window: status, repo/branch from the checkout, and
     /// the discovery labels. Best effort.
     async fn heartbeat(&self, status: &str) {
         let (remote, project, role) = {
             let st = self.state.read().await;
+            if self.awaiting_native(&st) {
+                return;
+            }
             let Some(c) = &st.connected else { return };
             (c.remote.clone(), st.project.clone(), st.role.clone())
         };
@@ -1203,13 +1223,16 @@ impl Proxy {
     async fn status(&self) -> Status {
         let st = self.state.read().await;
         let c = st.connected.as_ref();
+        let pending = self.awaiting_native(&st);
         Status {
-            connected: c.is_some(),
-            error: st.disconnected_reason.clone(),
+            connected: c.is_some() && !pending,
+            error: st.disconnected_reason.clone().or_else(|| pending.then(||
+                "Native Codex identity is pending: call session_status with this conversation's _meta.threadId. The bootstrap session is not a reply address.".to_owned()
+            )),
             agent: c.map(|c| c.agent.clone()),
             team: c.map(|c| c.team.clone()),
             session: st.session.clone(),
-            address: c.map(|c| format!("{}/{}", c.agent, st.session)),
+            address: c.filter(|_| !pending).map(|c| format!("{}/{}", c.agent, st.session)),
             project: st.project.clone(),
             role: st.role.clone(),
             channel: st.channel.clone(),
@@ -1286,16 +1309,21 @@ impl Proxy {
     /// the host multiplexes conversations over one process, which this proxy
     /// does not support and says so rather than mixing them.
     async fn observe_meta(&self, meta: &rmcp::model::RequestMetaObject) -> Result<(), ErrorData> {
+        let _binding = self.binding_gate.lock().await;
         let thread = meta
             .0
             .0
             .get("threadId")
-            .or_else(|| meta.0.0.get("sessionId"))
+            .or_else(|| {
+                (!self.opts.codex_wake)
+                    .then(|| meta.0.0.get("sessionId"))
+                    .flatten()
+            })
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty());
         let Some(thread) = thread else { return Ok(()) };
-        let (bound, current) = {
+        let (bound, current, incomplete_native) = {
             let st = self.state.read().await;
             if self.opts.codex_wake
                 && meta.0.0.get("threadId").and_then(Value::as_str).is_some()
@@ -1306,9 +1334,18 @@ impl Proxy {
                     None,
                 ));
             }
-            (st.host_id.clone(), st.binding)
+            (st.host_id.clone(), st.binding, self.awaiting_native(&st))
         };
         let result = match bound {
+            // A cancelled first bind may have staged this id without committing its connection.
+            Some(id) if id == thread && current == Binding::RequestMeta && incomplete_native => {
+                self.rebind(thread.to_owned()).await.map_err(|e| {
+                    ErrorData::internal_error(
+                        format!("could not finish binding the conversation: {e:#}"),
+                        None,
+                    )
+                })
+            }
             Some(id) if id == thread => Ok(()),
             Some(_) if current == Binding::RequestMeta => Err(ErrorData::invalid_request(
                 "this proxy instance is bound to another conversation; a second one is using \
@@ -1341,6 +1378,9 @@ impl Proxy {
             }
             drop(st);
             self.write_binding().await;
+            if self.opts.codex_wake {
+                self.heartbeat("active").await;
+            }
         }
         result
     }
@@ -1529,6 +1569,12 @@ impl Proxy {
     ) -> Result<CallToolResult, ErrorData> {
         let (remote, ct, generation, _guard) = {
             let st = self.state.read().await;
+            if self.awaiting_native(&st) {
+                return Err(ErrorData::invalid_request(
+                    "native Codex identity is pending; remote tools require this conversation's _meta.threadId",
+                    None,
+                ));
+            }
             if let Some(started) = bound
                 && st.generation != started
             {
@@ -1710,9 +1756,10 @@ impl Proxy {
         match &st.connected {
             Some(c) => {
                 lines.push(format!(
-                    "[ai-crew-sync] You are agent '{}' on team '{}', in session '{}'. Teammates \
-                     reach exactly this window at '{}/{}'.",
-                    c.agent, c.team, st.session, c.agent, st.session
+                    "[ai-crew-sync] Connected as agent '{}' on team '{}'. Call {STATUS_TOOL} \
+                     and whoami in this conversation for the current identity and reply address. \
+                     Cached initialization text is not a reply address.",
+                    c.agent, c.team
                 ));
                 lines.push(format!(
                     "- project: {}, role: {}, default channel: {}. Change them with \
@@ -1967,18 +2014,22 @@ impl Proxy {
     pub async fn shutdown(&self) {
         let remote = {
             let st = self.state.read().await;
-            st.connected.as_ref().map(|c| c.remote.clone())
+            st.connected
+                .as_ref()
+                .map(|c| (c.remote.clone(), !self.awaiting_native(&st)))
         };
-        if let Some(remote) = remote {
-            let _ = tokio::time::timeout(
-                EXIT_TIMEOUT,
-                call_remote(
-                    &remote,
-                    "heartbeat",
-                    json!({"status": "idle", "ttl_seconds": 120}),
-                ),
-            )
-            .await;
+        if let Some((remote, published)) = remote {
+            if published {
+                let _ = tokio::time::timeout(
+                    EXIT_TIMEOUT,
+                    call_remote(
+                        &remote,
+                        "heartbeat",
+                        json!({"status": "idle", "ttl_seconds": 120}),
+                    ),
+                )
+                .await;
+            }
             close_remote(remote).await;
         }
         // The credential stays on disk so a restart of this conversation can
@@ -2243,6 +2294,7 @@ mod renewal_tests {
                 generation: 0,
             })),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            binding_gate: Arc::new(Mutex::new(())),
             switch: Arc::new(Mutex::new(())),
             wake: Arc::new(tokio::sync::Notify::new()),
             project_dir: PathBuf::from("/repo"),
@@ -2414,5 +2466,393 @@ mod unauthorized_tests {
         )));
         assert!(!unauthorized(&e));
         assert!(!unauthorized(&ServiceError::TransportClosed));
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+
+    #[derive(Default)]
+    struct NativeGate {
+        enabled: std::sync::atomic::AtomicBool,
+        reject_registration: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeBus(Arc<Mutex<Vec<(String, Value)>>>, Arc<NativeGate>);
+
+    impl ServerHandler for FakeBus {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+        async fn list_tools(
+            &self,
+            _: Option<PaginatedRequestParams>,
+            _: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            Ok(crate::tools::catalogue(vec![Tool::new(
+                "whoami",
+                "Identity",
+                schema_of::<EmptyArgs>(),
+            )]))
+        }
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            let parts = context.extensions.get::<http::request::Parts>().unwrap();
+            let session = parts
+                .headers
+                .get(crate::auth::SESSION_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let mut args = Value::Object(request.arguments.unwrap_or_default());
+            args["_session_header"] = json!(session);
+            args["_epoch_header"] = json!(
+                parts
+                    .headers
+                    .get(crate::auth::EPOCH_HEADER)
+                    .and_then(|v| v.to_str().ok())
+            );
+            self.0.lock().await.push((request.name.to_string(), args));
+            if request.name == "whoami"
+                && session == session_for("native-thread")
+                && self.1.enabled.swap(false, Ordering::SeqCst)
+            {
+                self.1.entered.notify_one();
+                self.1.release.notified().await;
+            }
+            if request.name == "register_session"
+                && session == session_for("native-thread")
+                && self.1.reject_registration.load(Ordering::SeqCst)
+            {
+                return Err(ErrorData::invalid_request(
+                    "exact session is already live; its credential is required",
+                    None,
+                ));
+            }
+            let value = match request.name.as_ref() {
+                "whoami" => json!({"agent":"test-agent","team":"test-team"}),
+                "register_session" | "resume_session" => json!({
+                    "session_token":"test-session-credential", "session_id":"test-id",
+                    "epoch":1,"expires_at":"2099-01-01T00:00:00Z"
+                }),
+                _ => json!({}),
+            };
+            Ok(CallToolResult::structured(value).into())
+        }
+    }
+
+    async fn start(codex_wake: bool) -> (Proxy, FakeBus, CancellationToken, PathBuf) {
+        let bus = FakeBus::default();
+        let ct = CancellationToken::new();
+        let service: StreamableHttpService<FakeBus, LocalSessionManager> =
+            StreamableHttpService::new(
+                {
+                    let bus = bus.clone();
+                    move || Ok(bus.clone())
+                },
+                Default::default(),
+                StreamableHttpServerConfig::default()
+                    .with_json_response(true)
+                    .with_legacy_session_mode(false)
+                    .disable_allowed_hosts()
+                    .with_cancellation_token(ct.clone()),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let app = axum::Router::new().nest_service("/mcp", service);
+        tokio::spawn(
+            axum::serve(listener, app)
+                .with_graceful_shutdown(ct.clone().cancelled_owned())
+                .into_future(),
+        );
+        let dir = std::env::temp_dir().join(format!("acs-bootstrap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let proxy = Proxy::start(ProxyOptions {
+            codex_wake,
+            inputs: Inputs {
+                explicit_url: Some(url),
+                explicit_token: Some("test-agent-token".into()),
+                config_dir: dir.clone(),
+                project_dir: Some(dir.clone()),
+                ..Inputs::default()
+            },
+            state_dir: dir.clone(),
+            project: Some("test-project".into()),
+            ..ProxyOptions::default()
+        })
+        .await;
+        assert!(proxy.state.read().await.connected.is_some());
+        (proxy, bus, ct, dir)
+    }
+
+    #[tokio::test]
+    async fn codex_bootstrap_is_not_an_address_or_presence_and_cannot_forward() {
+        let (proxy, bus, ct, dir) = start(true).await;
+        let initial = proxy.status().await;
+        assert!(!initial.connected);
+        assert!(
+            initial
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("not a reply address")
+        );
+        assert!(
+            proxy
+                .state
+                .read()
+                .await
+                .connected
+                .as_ref()
+                .unwrap()
+                .tools
+                .iter()
+                .any(|t| t.name == "whoami"),
+            "catalogue remains available before binding"
+        );
+        assert!(
+            initial.address.is_none(),
+            "bootstrap is not a native reply address"
+        );
+        assert!(
+            !proxy
+                .get_info()
+                .instructions
+                .unwrap()
+                .contains(&initial.session)
+        );
+        proxy.heartbeat("active").await; // also used by periodic keepalive and configure
+        proxy.configure(ConfigureArgs::default()).await.unwrap();
+        assert!(
+            !bus.0
+                .lock()
+                .await
+                .iter()
+                .any(|(name, _)| name == "heartbeat")
+        );
+        assert!(
+            proxy
+                .forward(
+                    CallToolRequestParams::new("whoami"),
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+        let session_only = serde_json::from_value(json!({"sessionId":"not-native"})).unwrap();
+        proxy.observe_meta(&session_only).await.unwrap();
+        assert_eq!(proxy.state.read().await.binding, Binding::Instance);
+        let meta = serde_json::from_value(json!({"threadId":"native-thread"})).unwrap();
+        proxy.observe_meta(&meta).await.unwrap();
+        assert_eq!(
+            proxy.status().await.address.as_deref(),
+            Some(format!("test-agent/{}", session_for("native-thread")).as_str())
+        );
+        let calls = bus.0.lock().await.clone();
+        let presence: Vec<_> = calls
+            .iter()
+            .filter(|(name, _)| name == "heartbeat")
+            .collect();
+        assert_eq!(presence.len(), 1, "no retired bootstrap row is created");
+        assert_eq!(presence[0].1["project"], "test-project");
+        proxy.shutdown().await;
+        ct.cancel();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_native_calls_wait_for_the_exact_connection_commit() {
+        let (proxy, bus, ct, dir) = start(true).await;
+        bus.1.enabled.store(true, Ordering::SeqCst);
+        let call = |proxy: Proxy| async move {
+            let meta = serde_json::from_value(json!({"threadId":"native-thread"})).unwrap();
+            proxy.observe_meta(&meta).await.unwrap();
+            proxy
+                .forward(
+                    CallToolRequestParams::new("test_business"),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        };
+        let first = tokio::spawn(call(proxy.clone()));
+        tokio::time::timeout(Duration::from_secs(3), bus.1.entered.notified())
+            .await
+            .unwrap();
+        let mut second = tokio::spawn(call(proxy.clone()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "same-thread callers must wait for connection commit"
+        );
+        assert!(
+            !bus.0
+                .lock()
+                .await
+                .iter()
+                .any(|(name, _)| name == "heartbeat" || name == "test_business"),
+            "no bootstrap presence or application call before native commit"
+        );
+        assert!(proxy.status().await.address.is_none());
+        bus.1.release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+        let calls = bus.0.lock().await.clone();
+        let business: Vec<_> = calls
+            .iter()
+            .filter(|(name, _)| name == "test_business")
+            .collect();
+        assert_eq!(business.len(), 2);
+        for (_, args) in business {
+            assert_eq!(args["_session_header"], session_for("native-thread"));
+            assert_eq!(args["_epoch_header"], "1", "native session proof is active");
+        }
+        for (_, args) in calls.iter().filter(|(name, _)| name == "heartbeat") {
+            assert_eq!(args["_session_header"], session_for("native-thread"));
+        }
+        assert_eq!(proxy.state.read().await.binding, Binding::RequestMeta);
+        let conflict = serde_json::from_value(json!({"threadId":"another-thread"})).unwrap();
+        assert!(proxy.observe_meta(&conflict).await.is_err());
+        proxy.shutdown().await;
+        ct.cancel();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_first_native_bind_cannot_promote_the_bootstrap_connection() {
+        let (proxy, bus, ct, dir) = start(true).await;
+        bus.1.enabled.store(true, Ordering::SeqCst);
+        let first_proxy = proxy.clone();
+        let first = tokio::spawn(async move {
+            let meta = serde_json::from_value(json!({"threadId":"native-thread"})).unwrap();
+            first_proxy.observe_meta(&meta).await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(3), bus.1.entered.notified())
+            .await
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(proxy.status().await.address.is_none());
+        bus.1.release.notify_one();
+        let meta = serde_json::from_value(json!({"threadId":"native-thread"})).unwrap();
+        proxy.observe_meta(&meta).await.unwrap();
+        proxy
+            .forward(
+                CallToolRequestParams::new("test_business"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let calls = bus.0.lock().await.clone();
+        for (_, args) in calls
+            .iter()
+            .filter(|(name, _)| name == "heartbeat" || name == "test_business")
+        {
+            assert_eq!(args["_session_header"], session_for("native-thread"));
+            assert_eq!(args["_epoch_header"], "1");
+        }
+        proxy.shutdown().await;
+        ct.cancel();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_bind_with_unavailable_exact_credential_fails_closed() {
+        let (proxy, bus, ct, dir) = start(true).await;
+        bus.1.enabled.store(true, Ordering::SeqCst);
+        let first_proxy = proxy.clone();
+        let first = tokio::spawn(async move {
+            let meta = serde_json::from_value(json!({"threadId":"native-thread"})).unwrap();
+            first_proxy.observe_meta(&meta).await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(3), bus.1.entered.notified())
+            .await
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        bus.1.release.notify_one();
+        // Model a registration that committed on the bus before cancellation lost its credential.
+        bus.1.reject_registration.store(true, Ordering::SeqCst);
+        let meta = serde_json::from_value(json!({"threadId":"native-thread"})).unwrap();
+        assert!(proxy.observe_meta(&meta).await.is_err());
+        assert!(proxy.state.read().await.native_thread.is_none());
+        assert!(proxy.status().await.address.is_none());
+        assert!(
+            proxy
+                .forward(
+                    CallToolRequestParams::new("test_business"),
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            !bus.0
+                .lock()
+                .await
+                .iter()
+                .any(|(name, _)| name == "heartbeat"
+                    || name == "test_business"
+                    || name == "revoke_session")
+        );
+        proxy.shutdown().await;
+        ct.cancel();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_unbound_codex_bootstrap_never_creates_presence() {
+        let (proxy, bus, ct, dir) = start(true).await;
+        proxy.shutdown().await;
+        assert!(
+            !bus.0
+                .lock()
+                .await
+                .iter()
+                .any(|(name, _)| name == "heartbeat")
+        );
+        ct.cancel();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn generic_instance_still_advertises_presence_and_retires_before_revoke() {
+        let (proxy, bus, ct, dir) = start(false).await;
+        assert!(proxy.status().await.address.is_some());
+        let session = proxy.status().await.session;
+        assert!(
+            !proxy.get_info().instructions.unwrap().contains(&session),
+            "cached instructions cannot supply a reply address"
+        );
+        proxy.rebind("generic-thread".into()).await.unwrap();
+        let calls = bus.0.lock().await.clone();
+        let revoke = calls
+            .iter()
+            .position(|(name, _)| name == "revoke_session")
+            .unwrap();
+        let retirement = calls
+            .iter()
+            .position(|(name, args)| name == "heartbeat" && args["ttl_seconds"] == 30)
+            .unwrap();
+        assert!(
+            retirement < revoke,
+            "the credential must still authenticate retirement"
+        );
+        assert_eq!(calls[retirement].1["project"], "");
+        assert_eq!(calls[retirement].1["role"], "");
+        proxy.shutdown().await;
+        ct.cancel();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
