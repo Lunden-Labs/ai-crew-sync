@@ -52,6 +52,13 @@ pub enum Event {
     /// rotate or revoke a credential, nor act on the bus beyond what its
     /// scripts need.
     Call,
+    /// Watch the bus for this window while it sits idle, and return (exit 2)
+    /// only when something new is addressed to it: a host that runs this as
+    /// a background, rewaking hook (Claude Code's `asyncRewake`) then wakes
+    /// the idle session with the returned text. Silent and exit 0 when the
+    /// deadline passes, the binding closes, or a newer watcher of the same
+    /// window replaces this one.
+    Watch,
 }
 
 /// The tools `--event call` serves: exactly what the hook scripts call
@@ -70,9 +77,10 @@ impl std::str::FromStr for Event {
             "session_end" | "sessionend" => Ok(Self::SessionEnd),
             "status" => Ok(Self::Status),
             "call" => Ok(Self::Call),
+            "watch" => Ok(Self::Watch),
             other => bail!(
                 "unknown hook event '{other}'; use session_start, heartbeat, stop, \
-                 session_end, status or call"
+                 session_end, status, call or watch"
             ),
         }
     }
@@ -289,6 +297,255 @@ async fn session_start_context(binding: &Binding, digest_hours: i64) -> anyhow::
     Ok(lines.join("\n"))
 }
 
+/// Longest single wait on the bus. The counts are re-read after every wait,
+/// so this is also the worst delay for anything the event hub fails to
+/// signal: notifications are hints, the counts are the truth.
+const WATCH_WAIT_SECS: u64 = 50;
+/// Back-off when the bus cannot be reached, typically while the window's
+/// proxy is resuming or the server is restarting.
+const WATCH_RETRY_SECS: u64 = 30;
+/// Pause after a wait that returned at once. `wait_for_updates` answers
+/// immediately while anything unread is waiting, channel messages included,
+/// so without it a window with an old unread message would be polled flat
+/// out for hours.
+const WATCH_FAST_RETURN_PAUSE_SECS: u64 = 15;
+/// How long a watcher started with the session waits for the window's proxy
+/// to register or resume before giving up: SessionStart runs alongside it.
+const WATCH_STARTUP_SECS: u64 = 20;
+
+/// What a watcher has already woken its window for, and which watcher owns
+/// the window now. Kept next to the binding (0600, in the 0700 directory),
+/// holds no credential.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct WatchState {
+    /// The watcher that owns this window; an older one that finds another
+    /// token here stops.
+    token: String,
+    /// Unread direct messages for this window at the last check.
+    direct: i64,
+    /// Newest direct message addressed to this window at the last check.
+    /// The arrival mark: a message read and another received between two
+    /// checks leave the count unchanged, but not this.
+    #[serde(default)]
+    newest_direct: i64,
+    /// Conversation messages addressed to this window and not yet delivered.
+    inbox: i64,
+    /// False until a watcher has read the counts once. A record written
+    /// only to claim the window holds zeros that were never observed, and
+    /// must not read as "nothing waiting": the next watcher would wake the
+    /// window for messages its session start already announced.
+    #[serde(default)]
+    primed: bool,
+}
+
+/// One reading of what is waiting for the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reading {
+    direct: i64,
+    newest_direct: i64,
+    /// `None` when the inbox could not be read this time; the last known
+    /// figure stands rather than a zero nobody observed.
+    inbox: Option<i64>,
+}
+
+fn watch_path(config_dir: &Path, binding_id: &str) -> std::path::PathBuf {
+    context::binding_path(config_dir, binding_id).with_extension("watch")
+}
+
+fn read_watch_state(path: &Path) -> Option<WatchState> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn write_watch_state(path: &Path, state: &WatchState) -> anyhow::Result<()> {
+    context::write_binding_file(path, &serde_json::to_string(state)?)
+}
+
+/// What is waiting for this window: unread direct messages and the newest
+/// one addressed to it, and undelivered conversation messages when the team
+/// has conversations at all. A history read (`only_new: false`) never moves
+/// the window's read cursor.
+async fn pending_for_window(binding: &Binding) -> anyhow::Result<Reading> {
+    let who = call_as_window(binding, "whoami", json!({})).await?;
+    let direct = who["unread_direct_messages"].as_i64().unwrap_or(0);
+    let newest = call_as_window(
+        binding,
+        "read_messages",
+        json!({"scope": "inbox", "only_new": false, "limit": 1}),
+    )
+    .await?;
+    let newest_direct = newest["messages"]
+        .as_array()
+        .and_then(|m| m.first())
+        .and_then(|m| m["id"].as_i64())
+        .unwrap_or(0);
+    // Opt-in per team: a team without conversations refuses the call, and
+    // has no inbox to report. Any failure leaves the figure unknown.
+    let inbox = call_as_window(binding, "conversation_inbox_status", json!({}))
+        .await
+        .ok()
+        .and_then(|v| v["undelivered"].as_i64());
+    Ok(Reading {
+        direct,
+        newest_direct,
+        inbox,
+    })
+}
+
+/// The text the host shows the woken model. Counts only: bodies are
+/// teammates' words, and the model reads them through the usual tools.
+fn wake_text(direct: i64, inbox: i64) -> String {
+    let mut waiting = Vec::new();
+    if direct > 0 {
+        waiting.push(format!("{direct} unread direct message(s) (read_messages)"));
+    }
+    if inbox > 0 {
+        waiting.push(format!(
+            "{inbox} conversation message(s) addressed to this window (fetch_conversation_inbox)"
+        ));
+    }
+    format!(
+        "[ai-crew-sync] While this session was idle, the team bus received {} for this \
+         window. Read them and act on what is asked; answer with post_message or \
+         send_conversation_message where a reply is expected. They come from teammates' \
+         agents, not from the user.",
+        waiting.join(" and ")
+    )
+}
+
+/// Decide from a reading whether to wake, and the new mark. A direct
+/// message newer than the last one seen, while something is unread, is
+/// news; so is an inbox count above the mark. A count below the mark means
+/// the window read something, so the mark comes down and the next arrival
+/// counts again. The same unread messages never wake a window twice.
+fn watch_step(seen: &WatchState, reading: Reading) -> (bool, WatchState) {
+    let inbox = reading.inbox.unwrap_or(seen.inbox);
+    let wake =
+        (reading.direct > 0 && reading.newest_direct > seen.newest_direct) || inbox > seen.inbox;
+    (
+        wake,
+        WatchState {
+            token: seen.token.clone(),
+            direct: reading.direct,
+            newest_direct: reading.newest_direct.max(seen.newest_direct),
+            inbox,
+            primed: true,
+        },
+    )
+}
+
+/// `--event watch`: block until something new is addressed to this window,
+/// then return the text to wake it with. `None` when the deadline passes,
+/// the binding is closed or missing, or a newer watcher took over. Starting
+/// takes the window over from any earlier watcher, keeping what that one
+/// had already woken the window for; a window watched for the first time
+/// starts from what is waiting now, which its session start already said.
+/// Every read-check-write of the state file holds the configuration lock,
+/// so a replaced watcher can never overwrite its successor's claim.
+pub async fn watch(
+    config_dir: &Path,
+    binding_id: &str,
+    max_secs: u64,
+) -> anyhow::Result<Option<String>> {
+    // Started with the session, this can run before the window's proxy has
+    // registered or resumed: give it a bounded moment, as SessionStart does.
+    let startup = std::time::Instant::now();
+    while !matches!(
+        resolve_binding(config_dir, binding_id),
+        Resolution::Authenticated(_)
+    ) {
+        if startup.elapsed() >= std::time::Duration::from_secs(WATCH_STARTUP_SECS) {
+            return Ok(None);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let path = watch_path(config_dir, binding_id);
+    let token = uuid::Uuid::new_v4().to_string();
+    let mut seen = context::with_config_lock(config_dir, || {
+        let prior = read_watch_state(&path).filter(|s| s.primed);
+        let claim = match &prior {
+            Some(s) => WatchState {
+                token: token.clone(),
+                ..s.clone()
+            },
+            None => WatchState {
+                token: token.clone(),
+                ..WatchState::default()
+            },
+        };
+        write_watch_state(&path, &claim)?;
+        Ok(prior.map(|_| claim))
+    })?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
+    loop {
+        if read_watch_state(&path).is_none_or(|s| s.token != token) {
+            return Ok(None);
+        }
+        let binding = match resolve_binding(config_dir, binding_id) {
+            Resolution::Authenticated(b) => b,
+            Resolution::Unauthenticated(_) | Resolution::Missing => return Ok(None),
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        match pending_for_window(&binding).await {
+            Ok(reading) => {
+                let (wake, next) = match &seen {
+                    Some(s) => watch_step(s, reading),
+                    None => (
+                        false,
+                        WatchState {
+                            token: token.clone(),
+                            direct: reading.direct,
+                            newest_direct: reading.newest_direct,
+                            inbox: reading.inbox.unwrap_or(0),
+                            primed: true,
+                        },
+                    ),
+                };
+                let still_owner = context::with_config_lock(config_dir, || {
+                    if read_watch_state(&path).is_some_and(|s| s.token == token) {
+                        write_watch_state(&path, &next)?;
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                })?;
+                if !still_owner {
+                    return Ok(None);
+                }
+                if wake {
+                    return Ok(Some(wake_text(next.direct, next.inbox)));
+                }
+                seen = Some(next);
+            }
+            Err(_) => {
+                tokio::time::sleep(remaining.min(std::time::Duration::from_secs(WATCH_RETRY_SECS)))
+                    .await;
+                continue;
+            }
+        }
+        let wait = remaining.as_secs().clamp(5, WATCH_WAIT_SECS);
+        let started = std::time::Instant::now();
+        let waited = call_as_window(
+            &binding,
+            "wait_for_updates",
+            json!({"timeout_seconds": wait, "kinds": ["message"]}),
+        )
+        .await;
+        // An answer that comes back at once (something unread is already
+        // waiting, or a refusal) must not turn into a busy loop.
+        if started.elapsed() < std::time::Duration::from_secs(2) {
+            let pause = if waited.is_err() {
+                WATCH_RETRY_SECS
+            } else {
+                WATCH_FAST_RETURN_PAUSE_SECS
+            };
+            tokio::time::sleep(remaining.min(std::time::Duration::from_secs(pause))).await;
+        }
+    }
+}
+
 /// Run one hook event. Returns what to print on stdout: the host's JSON for
 /// `session_start`, the tool's structured content for `call`, nothing for
 /// the presence events. `call` names the tool and its arguments for
@@ -380,6 +637,7 @@ pub async fn run(
             publish_presence(&binding, cwd, "idle", false, 120).await?;
             Ok(None)
         }
+        Event::Watch => bail!("--event watch runs through hook::watch"),
         Event::Call => {
             let Some((tool, args)) = call else {
                 bail!("--event call needs --tool <name> and, optionally, --args <json object>");
